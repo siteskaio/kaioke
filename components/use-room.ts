@@ -1,0 +1,6 @@
+'use client';
+import {useCallback,useEffect,useState} from 'react';import type {Room,Song} from '@/lib/types';
+export function useRoom(code:string){const [room,setRoom]=useState<Room|null>(null);const [songs,setSongs]=useState<Song[]>([]);const [error,setError]=useState('');const [loading,setLoading]=useState(true);
+const refresh=useCallback(async()=>{try{const res=await fetch(`/api/rooms/${code}`,{cache:'no-store'});const data=await res.json();if(!res.ok)throw new Error(data.error);setRoom(data.room);setSongs(data.songs);setError('')}catch(e){setError(e instanceof Error?e.message:'Falha ao consultar sala')}finally{setLoading(false)}},[code]);
+useEffect(()=>{refresh();const timer=setInterval(refresh,2500);const vis=()=>{if(!document.hidden)refresh()};document.addEventListener('visibilitychange',vis);return()=>{clearInterval(timer);document.removeEventListener('visibilitychange',vis)}},[refresh]);return {room,songs,error,loading,refresh}}
+export async function postJson(url:string,body:unknown,key?:string){const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',...(key?{'x-admin-key':key}:{})},body:JSON.stringify(body)});const data=await res.json();if(!res.ok)throw Error(data.error||'Falha ao enviar');return data}
