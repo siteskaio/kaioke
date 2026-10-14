@@ -1,3 +1,4 @@
+
 "use client";
 
 import {
@@ -25,29 +26,52 @@ import {
 
 import { useRoom, postJson } from "./use-room";
 import YoutubePlayer from "./youtube-player";
+import KaraokeScore from "./karaoke-score";
 
 type Props = {
   code: string;
 };
 
-type Particle = {
-  id: number;
-  left: number;
-  top: number;
-  size: number;
-  delay: number;
-  duration: number;
-  opacity: number;
-  symbol: string;
+type ScoreSong = {
+  id: string;
+  singer: string;
+  title: string;
 };
 
+const SCORE_DURATION = 6500;
+
+const particles = Array.from({ length: 24 }, (_, i) => ({
+  id: i,
+  symbol: ["♪", "♫", "✦", "★"][i % 4],
+  left: (i * 37 + 11) % 100,
+  top: (i * 29 + 7) % 100,
+  delay: (i % 8) * -1.1,
+  duration: 7 + (i % 7),
+  size: 14 + (i % 5) * 6,
+}));
+
 export default function TvClient({ code }: Props) {
-  const { room, songs, error, loading, refresh } = useRoom(code);
+  const {
+    room,
+    songs,
+    error,
+    loading,
+    refresh,
+  } = useRoom(code);
 
   const [adminKey, setAdminKey] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
 
+  // Sistema de avaliação.
+  const [showScore, setShowScore] = useState(false);
+  const [scoreSong, setScoreSong] =
+    useState<ScoreSong | null>(null);
+
+  const scoreTimerRef =
+    useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const scoreSongIdRef = useRef<string | null>(null);
   const advancingRef = useRef(false);
   const endedSongRef = useRef<string | null>(null);
 
@@ -59,53 +83,86 @@ export default function TvClient({ code }: Props) {
   const currentVideoId = current?.video_id ?? null;
   const playing = room?.playback_state === "playing";
 
-  const queue = songs
-    .filter((song) => song.status === "queued")
-    .sort((a, b) => a.position - b.position);
+  const queue = useMemo(
+    () =>
+      songs
+        .filter((song) => song.status === "queued")
+        .sort((a, b) => a.position - b.position),
+    [songs]
+  );
 
   const finished = songs.filter(
-    (song) => song.status === "done"
+    (song) =>
+      song.status === "done" ||
+      song.status === "skipped"
   ).length;
 
   const currentIdRef = useRef<string | null>(null);
   const playingRef = useRef(false);
+  const songsRef = useRef(songs);
 
   currentIdRef.current = currentId;
   playingRef.current = playing;
+  songsRef.current = songs;
 
+  // Recupera a autorização do anfitrião.
   useEffect(() => {
     const key =
       localStorage.getItem(`kaioke_admin_${code}`) || "";
+
     setAdminKey(key);
   }, [code]);
 
+  // Limpa o temporizador quando a página for fechada.
   useEffect(() => {
-    endedSongRef.current = null;
-    console.log("[KAIOKÊ] Música atual:", currentId, currentVideoId);
-  }, [currentId, currentVideoId]);
-
-  const particles = useMemo<Particle[]>(() => {
-    const symbols = ["♪", "♫", "✦", "•", "🎵"];
-    return Array.from({ length: 22 }).map((_, index) => ({
-      id: index,
-      left: Math.random() * 100,
-      top: Math.random() * 100,
-      size: 16 + Math.random() * 24,
-      delay: Math.random() * 6,
-      duration: 8 + Math.random() * 8,
-      opacity: 0.12 + Math.random() * 0.22,
-      symbol: symbols[index % symbols.length],
-    }));
+    return () => {
+      if (scoreTimerRef.current) {
+        clearTimeout(scoreTimerRef.current);
+      }
+    };
   }, []);
 
+  function cancelScore() {
+    if (scoreTimerRef.current) {
+      clearTimeout(scoreTimerRef.current);
+      scoreTimerRef.current = null;
+    }
+
+    scoreSongIdRef.current = null;
+    setShowScore(false);
+    setScoreSong(null);
+  }
+
+  // Quando a música atual muda, libera a nova avaliação.
+  useEffect(() => {
+    if (
+      scoreSongIdRef.current &&
+      currentId !== scoreSongIdRef.current
+    ) {
+      if (scoreTimerRef.current) {
+        clearTimeout(scoreTimerRef.current);
+        scoreTimerRef.current = null;
+      }
+
+      scoreSongIdRef.current = null;
+      setShowScore(false);
+      setScoreSong(null);
+    }
+
+    endedSongRef.current = null;
+  }, [currentId]);
+
+  // Comandos administrativos do Supabase.
   const action = useCallback(
     async (command: string, id?: string) => {
       const key =
-        localStorage.getItem(`kaioke_admin_${code}`) || "";
+        localStorage.getItem(
+          `kaioke_admin_${code}`
+        ) || "";
 
       if (!key) {
         setNotice(
-          "Você precisa abrir o telão no navegador do anfitrião."
+          "Abra o telão no navegador do anfitrião."
         );
         return false;
       }
@@ -124,9 +181,13 @@ export default function TvClient({ code }: Props) {
         );
 
         await refresh();
+
         return true;
       } catch (err) {
-        console.error("[KAIOKÊ] Erro no comando:", command, err);
+        console.error(
+          "[KAIOKÊ] Erro no comando:",
+          err
+        );
 
         setNotice(
           err instanceof Error
@@ -142,65 +203,109 @@ export default function TvClient({ code }: Props) {
     [code, refresh]
   );
 
+  // Próxima música: proteção contra chamadas simultâneas.
   const nextSong = useCallback(async () => {
-    if (advancingRef.current) {
-      return false;
-    }
+    if (advancingRef.current) return false;
 
     advancingRef.current = true;
 
     try {
-      console.log("[KAIOKÊ] Avançando para a próxima música");
       return await action("next");
     } finally {
       advancingRef.current = false;
     }
   }, [action]);
 
-  const handleEnded = useCallback(async () => {
-    const songId = currentIdRef.current;
-
-    if (!songId) return;
-    if (!playingRef.current) return;
-    if (endedSongRef.current === songId) return;
-    if (advancingRef.current) return;
-
-    endedSongRef.current = songId;
-
-    console.log("[KAIOKÊ] Vídeo terminou:", songId);
-
-    const success = await nextSong();
-
-    if (!success) {
-      endedSongRef.current = null;
-    }
-  }, [nextSong]);
-
+  // Avanço manual: cancela a avaliação, se estiver aberta.
   const handleNext = useCallback(async () => {
     if (advancingRef.current) return;
 
-    const success = await nextSong();
-
-    if (success) {
-      console.log("[KAIOKÊ] Próxima música solicitada");
+    if (scoreTimerRef.current) {
+      clearTimeout(scoreTimerRef.current);
+      scoreTimerRef.current = null;
     }
+
+    scoreSongIdRef.current = null;
+    setShowScore(false);
+    setScoreSong(null);
+
+    await nextSong();
   }, [nextSong]);
 
+  // Executado quando o vídeo termina naturalmente.
+  const handleEnded = useCallback(() => {
+    const songId = currentIdRef.current;
+
+    if (!songId || !playingRef.current) return;
+    if (endedSongRef.current === songId) return;
+    if (advancingRef.current) return;
+
+    const finishedSong = songsRef.current.find(
+      (song) => song.id === songId
+    );
+
+    if (!finishedSong) return;
+
+    endedSongRef.current = songId;
+    scoreSongIdRef.current = songId;
+
+    // Exibe a avaliação por cima do player.
+    setScoreSong({
+      id: songId,
+      singer: finishedSong.requested_by,
+      title: finishedSong.title,
+    });
+
+    setShowScore(true);
+
+    if (scoreTimerRef.current) {
+      clearTimeout(scoreTimerRef.current);
+    }
+
+    scoreTimerRef.current = setTimeout(async () => {
+      scoreTimerRef.current = null;
+
+      // Não avança se outra música já assumiu o palco.
+      if (scoreSongIdRef.current !== songId) return;
+      if (currentIdRef.current !== songId) return;
+
+      const success = await nextSong();
+
+      if (!success) {
+        endedSongRef.current = null;
+        setNotice(
+          "Não foi possível avançar. Use o botão Próxima."
+        );
+      }
+
+      scoreSongIdRef.current = null;
+      setShowScore(false);
+      setScoreSong(null);
+    }, SCORE_DURATION);
+  }, [nextSong]);
+
+  // Play e pause.
   const togglePlayback = useCallback(async () => {
+    if (showScore) return;
+
     if (!currentId) {
-      if (queue.length > 0) {
+      if (queue.length) {
         await handleNext();
       }
       return;
     }
 
-    if (playing) {
-      await action("pause");
-    } else {
-      await action("resume");
-    }
-  }, [action, currentId, playing, queue.length, handleNext]);
+    await action(playing ? "pause" : "resume");
+  }, [
+    action,
+    currentId,
+    playing,
+    queue.length,
+    handleNext,
+    showScore,
+  ]);
 
+  // Atualiza quando o navegador volta ao primeiro plano.
   useEffect(() => {
     const onVisible = () => {
       if (document.visibilityState === "visible") {
@@ -208,13 +313,20 @@ export default function TvClient({ code }: Props) {
       }
     };
 
-    document.addEventListener("visibilitychange", onVisible);
+    document.addEventListener(
+      "visibilitychange",
+      onVisible
+    );
 
     return () => {
-      document.removeEventListener("visibilitychange", onVisible);
+      document.removeEventListener(
+        "visibilitychange",
+        onVisible
+      );
     };
   }, [refresh]);
 
+  // Modo tela cheia.
   async function full() {
     try {
       if (!document.fullscreenElement) {
@@ -223,7 +335,9 @@ export default function TvClient({ code }: Props) {
         await document.exitFullscreen();
       }
     } catch {
-      setNotice("Não foi possível ativar a tela cheia.");
+      setNotice(
+        "Não foi possível ativar a tela cheia."
+      );
     }
   }
 
@@ -231,7 +345,7 @@ export default function TvClient({ code }: Props) {
     return (
       <div className="page-loading">
         <LoaderCircle className="spin" />
-        Acendendo as luzes...
+        Preparando o palco...
       </div>
     );
   }
@@ -246,818 +360,918 @@ export default function TvClient({ code }: Props) {
   }
 
   return (
-    <>
-      <div className="tv-karaoke-shell">
-        {/* FUNDO COM EFEITOS */}
-        <div className="tv-background-glow tv-background-glow-1" />
-        <div className="tv-background-glow tv-background-glow-2" />
-        <div className="tv-background-glow tv-background-glow-3" />
+    <div className="kaioke-tv">
 
-        {particles.map((particle) => (
+      {/* FUNDO ANIMADO */}
+      <div className="ambient ambient-one" />
+      <div className="ambient ambient-two" />
+
+      <div className="floating-effects" aria-hidden="true">
+        {particles.map((p) => (
           <span
-            key={particle.id}
-            className="floating-particle"
+            key={p.id}
             style={{
-              left: `${particle.left}%`,
-              top: `${particle.top}%`,
-              fontSize: `${particle.size}px`,
-              animationDelay: `${particle.delay}s`,
-              animationDuration: `${particle.duration}s`,
-              opacity: particle.opacity,
+              left: `${p.left}%`,
+              top: `${p.top}%`,
+              fontSize: p.size,
+              animationDelay: `${p.delay}s`,
+              animationDuration: `${p.duration}s`,
             }}
           >
-            {particle.symbol}
+            {p.symbol}
           </span>
         ))}
+      </div>
 
-        {/* LATERAL */}
-        <aside className="tv-karaoke-sidebar">
-          <div className="tv-sidebar-brand">
-            <div className="tv-brand-badge">
-              <Mic2 size={18} />
+      {/* LATERAL: FILA */}
+      <aside className="tv-side">
+
+        <div className="tv-logo">
+          <div className="logo-icon">
+            <Mic2 size={23} />
+          </div>
+
+          <div>
+            <strong>
+              KAI<span>OKÊ</span>
+            </strong>
+            <small>SEU PALCO, SUA FESTA</small>
+          </div>
+        </div>
+
+        <div className="room-code">
+          SALA <strong>{code}</strong>
+        </div>
+
+        <div className="queue-heading">
+          <ListMusic size={19} />
+          <span>PRÓXIMAS MÚSICAS</span>
+          <b>{queue.length}</b>
+        </div>
+
+        <div className="tv-list">
+          {queue.length === 0 ? (
+            <div className="empty-queue">
+              <Music2 size={38} />
+              <strong>A fila está vazia</strong>
+              <p>
+                Peça aos convidados para
+                adicionarem músicas pelo celular.
+              </p>
             </div>
-
-            <div>
-              <div className="tv-brand-name">
-                KAI<span>OKÊ</span>
-              </div>
-              <div className="tv-brand-subtitle">
-                painel do show
-              </div>
-            </div>
-          </div>
-
-          <div className="tv-sidebar-room-code">
-            SALA <strong>{code}</strong>
-          </div>
-
-          <div className="tv-sidebar-section-title">
-            <ListMusic size={16} />
-            Fila de músicas
-          </div>
-
-          <div className="tv-queue-list">
-            {queue.length === 0 ? (
-              <div className="tv-queue-empty">
-                <Music2 size={34} />
-                <p>Nenhuma música na fila.</p>
-                <span>
-                  Use a tela de pedidos no celular para adicionar.
+          ) : (
+            queue.map((song, index) => (
+              <div className="queue-track" key={song.id}>
+                <span className="track-position">
+                  {String(index + 1).padStart(2, "0")}
                 </span>
-              </div>
-            ) : (
-              queue.map((song, index) => (
-                <div className="tv-queue-item" key={song.id}>
-                  <div className="tv-queue-position">
-                    {String(index + 1).padStart(2, "0")}
-                  </div>
 
-                  <img
-                    className="tv-queue-thumb"
-                    src={song.thumbnail}
-                    alt={song.title}
-                  />
+                <img
+                  src={song.thumbnail}
+                  alt={song.title}
+                />
 
-                  <div className="tv-queue-info">
-                    <strong title={song.title}>{song.title}</strong>
-                    <span>{song.requested_by}</span>
-                  </div>
-
-                  {adminKey && (
-                    <button
-                      className="tv-queue-remove"
-                      disabled={busy}
-                      title="Remover música"
-                      onClick={() => void action("remove", song.id)}
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  )}
-                </div>
-              ))
-            )}
-          </div>
-
-          <div className="tv-sidebar-stats">
-            <div className="tv-stat-box">
-              <span>Na fila</span>
-              <strong>{queue.length}</strong>
-            </div>
-
-            <div className="tv-stat-box">
-              <span>Cantadas</span>
-              <strong>{finished}</strong>
-            </div>
-          </div>
-        </aside>
-
-        {/* ÁREA CENTRAL */}
-        <main className="tv-karaoke-main">
-          <header className="tv-topbar">
-            <div className="tv-topbar-left">
-              <span className="tv-live-pill">
-                <span className="tv-live-dot" />
-                {current ? "NO PALCO AGORA" : "PRONTO PARA COMEÇAR"}
-              </span>
-
-              <h1 className="tv-party-title">
-                {room?.name || "Noite de Karaokê"}
-              </h1>
-            </div>
-
-            <div className="tv-topbar-actions">
-              <button
-                className="tv-icon-button"
-                onClick={() => void full()}
-                title="Tela cheia"
-              >
-                <Maximize size={18} />
-              </button>
-            </div>
-          </header>
-
-          <section className="tv-stage-card">
-            <div className="tv-stage-player">
-              <YoutubePlayer
-                videoId={currentVideoId}
-                songId={currentId}
-                playing={playing}
-                onEnded={() => {
-                  void handleEnded();
-                }}
-              />
-
-              {!current && (
-                <div className="tv-stage-empty-overlay">
-                  <div className="tv-stage-empty-icon">
-                    <Mic2 size={74} strokeWidth={1.2} />
-                  </div>
-
-                  <span className="tv-stage-empty-mini">
-                    O PALCO ESTÁ PRONTO
-                  </span>
-
-                  <h2>Só falta começar o show.</h2>
-
-                  <p>
-                    Adicione músicas pelo celular e clique em
-                    começar quando estiver tudo pronto.
-                  </p>
-
-                  <button
-                    className="tv-main-action-button"
-                    disabled={!queue.length || !adminKey || busy}
-                    onClick={() => void handleNext()}
-                  >
-                    <Play size={18} fill="currentColor" />
-                    {queue.length ? "Começar show" : "Aguardando músicas"}
-                  </button>
-                </div>
-              )}
-            </div>
-
-            <div className="tv-now-playing-bar">
-              <div className="tv-now-playing-left">
-                <div className="tv-now-thumb">
-                  {current ? (
-                    <img src={current.thumbnail} alt={current.title} />
-                  ) : (
-                    <Mic2 size={20} />
-                  )}
-                </div>
-
-                <div className="tv-now-meta">
-                  <span>AGORA TOCANDO</span>
-                  <strong>
-                    {current?.title || "A próxima atração é você!"}
+                <div className="queue-info">
+                  <strong title={song.title}>
+                    {song.title}
                   </strong>
                   <small>
-                    {current
-                      ? `🎤 ${current.requested_by}`
-                      : "Adicione músicas para começar"}
+                    🎤 {song.requested_by}
                   </small>
                 </div>
+
+                {adminKey && (
+                  <button
+                    className="remove-track"
+                    title="Remover música"
+                    disabled={busy}
+                    onClick={() =>
+                      void action("remove", song.id)
+                    }
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className="tv-stats">
+          <div>
+            <span>NA FILA</span>
+            <strong>{queue.length}</strong>
+          </div>
+
+          <div>
+            <span>APRESENTAÇÕES</span>
+            <strong>{finished}</strong>
+          </div>
+        </div>
+      </aside>
+
+      {/* PALCO CENTRAL */}
+      <main className="tv-content-new">
+
+        <header className="tv-top">
+          <div>
+            <div className="live-label">
+              <span className="live-dot" />
+              {showScore
+                ? "AVALIAÇÃO DO SHOW"
+                : current
+                  ? "NO PALCO AGORA"
+                  : "PALCO PRONTO"}
+            </div>
+
+            <h1>
+              {room?.name || "Noite de Karaokê"}
+              <span> ✦</span>
+            </h1>
+          </div>
+
+          <button
+            className="fullscreen-button"
+            onClick={() => void full()}
+            title="Tela cheia"
+          >
+            <Maximize size={20} />
+          </button>
+        </header>
+
+        <section className="main-stage">
+
+          {/* ÁREA DO PLAYER */}
+          <div className="stage-screen">
+
+            <YoutubePlayer
+              videoId={currentVideoId}
+              songId={currentId}
+              playing={playing}
+              onEnded={handleEnded}
+            />
+
+            {/* TELA VAZIA */}
+            {!current && !showScore && (
+              <div className="stage-waiting">
+                <div className="waiting-icon">
+                  <Mic2 size={76} strokeWidth={1.2} />
+                </div>
+
+                <span>AS LUZES ESTÃO ACESAS</span>
+
+                <h2>Seu palco está pronto!</h2>
+
+                <p>
+                  Prepare o microfone.
+                  O próximo show começa aqui.
+                </p>
+
+                <button
+                  className="start-show"
+                  disabled={
+                    !queue.length ||
+                    !adminKey ||
+                    busy
+                  }
+                  onClick={() => void handleNext()}
+                >
+                  <Play
+                    size={19}
+                    fill="currentColor"
+                  />
+                  {queue.length
+                    ? "Começar show"
+                    : "Aguardando músicas"}
+                </button>
+              </div>
+            )}
+
+            {/* AVALIAÇÃO NO FINAL DA MÚSICA */}
+            {showScore && scoreSong && (
+              <KaraokeScore
+                key={scoreSong.id}
+                singer={scoreSong.singer}
+                songTitle={scoreSong.title}
+              />
+            )}
+
+          </div>
+
+          {/* CONTROLES ABAIXO DO VÍDEO */}
+          <div className="playing-bar">
+
+            <div className="song-meta">
+              <div className="current-cover">
+                {current ? (
+                  <img
+                    src={current.thumbnail}
+                    alt={current.title}
+                  />
+                ) : (
+                  <Mic2 size={24} />
+                )}
               </div>
 
-              <div className="tv-player-actions">
-                <button
-                  disabled={!current || busy || !adminKey}
-                  title={playing ? "Pausar" : "Reproduzir"}
-                  className="tv-main-play"
-                  onClick={() => void togglePlayback()}
-                >
-                  {playing ? (
-                    <Pause size={20} fill="currentColor" />
-                  ) : (
-                    <Play size={20} fill="currentColor" />
-                  )}
-                </button>
+              <div className="current-info">
+                <small>
+                  {showScore
+                    ? "APRESENTAÇÃO FINALIZADA"
+                    : "AGORA TOCANDO"}
+                </small>
 
-                <button
-                  disabled={busy || (!current && !queue.length) || !adminKey}
-                  onClick={() => void handleNext()}
-                  className="tv-skip-button"
-                  title="Próxima música"
-                >
-                  <SkipForward size={20} />
-                </button>
+                <strong>
+                  {current?.title ||
+                    "A próxima atração é você!"}
+                </strong>
+
+                <span>
+                  {current
+                    ? `🎤 ${current.requested_by}`
+                    : "Prepare a voz!"}
+                </span>
               </div>
             </div>
-          </section>
-        </main>
 
+            <div className="play-controls">
+
+              <button
+                className="control-play"
+                disabled={
+                  !current ||
+                  busy ||
+                  !adminKey ||
+                  showScore
+                }
+                onClick={() =>
+                  void togglePlayback()
+                }
+                title={
+                  playing
+                    ? "Pausar"
+                    : "Reproduzir"
+                }
+              >
+                {playing ? (
+                  <Pause
+                    size={21}
+                    fill="currentColor"
+                  />
+                ) : (
+                  <Play
+                    size={21}
+                    fill="currentColor"
+                  />
+                )}
+              </button>
+
+              <button
+                className="control-next"
+                disabled={
+                  busy ||
+                  !adminKey ||
+                  (!current && !queue.length)
+                }
+                onClick={() => void handleNext()}
+                title="Próxima música"
+              >
+                <SkipForward size={22} />
+              </button>
+
+            </div>
+          </div>
+
+        </section>
+
+        {/* MENSAGENS */}
         {notice && (
-          <div className="tv-toast">
-            <Sparkles size={16} />
+          <div className="tv-message">
+            <Sparkles size={18} />
             <span>{notice}</span>
-            <button onClick={() => setNotice("")}>×</button>
+            <button
+              onClick={() => setNotice("")}
+            >
+              ×
+            </button>
           </div>
         )}
 
         {!adminKey && (
-          <div className="host-warning">
-            Modo convidado: os controles estão disponíveis somente
+          <div className="tv-warning">
+            Controles disponíveis apenas
             para o anfitrião.
-            <Link href={`/room/${code}`}>Pedir música</Link>
+            <Link href={`/room/${code}`}>
+              Pedir música
+            </Link>
           </div>
         )}
-      </div>
+
+      </main>
 
       <style jsx>{`
-        .tv-karaoke-shell {
+        .kaioke-tv {
           position: relative;
-          min-height: 100vh;
+          isolation: isolate;
           display: grid;
-          grid-template-columns: 360px 1fr;
-          background:
-            radial-gradient(circle at top, rgba(168, 85, 247, 0.18), transparent 30%),
-            radial-gradient(circle at bottom right, rgba(236, 72, 153, 0.15), transparent 26%),
-            linear-gradient(135deg, #070510 0%, #0c0920 48%, #130a1d 100%);
+          grid-template-columns: 330px minmax(0, 1fr);
+          min-height: 100vh;
+          background: linear-gradient(
+            125deg,
+            #080511,
+            #100824 55%,
+            #170a22
+          );
+          color: white;
           overflow: hidden;
-          color: #fff;
         }
 
-        .tv-background-glow {
+        .ambient {
           position: absolute;
-          border-radius: 999px;
-          filter: blur(70px);
+          z-index: -1;
           pointer-events: none;
-          z-index: 0;
+          border-radius: 50%;
+          filter: blur(90px);
         }
 
-        .tv-background-glow-1 {
-          width: 280px;
-          height: 280px;
-          top: 40px;
-          left: 420px;
-          background: rgba(168, 85, 247, 0.2);
+        .ambient-one {
+          width: 380px;
+          height: 380px;
+          background: #6b21a844;
+          top: -100px;
+          left: 40%;
         }
 
-        .tv-background-glow-2 {
-          width: 260px;
-          height: 260px;
-          bottom: 60px;
-          right: 80px;
-          background: rgba(236, 72, 153, 0.18);
+        .ambient-two {
+          width: 350px;
+          height: 350px;
+          background: #db277744;
+          right: -100px;
+          bottom: -100px;
         }
 
-        .tv-background-glow-3 {
-          width: 180px;
-          height: 180px;
-          top: 50%;
-          left: 50%;
-          background: rgba(59, 130, 246, 0.12);
-          transform: translate(-50%, -50%);
-        }
-
-        .floating-particle {
+        .floating-effects {
           position: absolute;
+          inset: 0;
           z-index: 0;
-          color: #ffffff;
-          user-select: none;
+          overflow: hidden;
           pointer-events: none;
-          animation-name: floatKaraoke;
-          animation-timing-function: ease-in-out;
-          animation-iteration-count: infinite;
         }
 
-        @keyframes floatKaraoke {
-          0% {
-            transform: translateY(0px) translateX(0px) rotate(0deg) scale(1);
+        .floating-effects span {
+          position: absolute;
+          color: #d8b4fe;
+          opacity: 0.19;
+          animation: float-note 9s
+            ease-in-out infinite;
+        }
+
+        @keyframes float-note {
+          0%, 100% {
+            transform: translate(0, 0)
+              rotate(0deg);
           }
-          25% {
-            transform: translateY(-14px) translateX(8px) rotate(6deg) scale(1.04);
-          }
+
           50% {
-            transform: translateY(-24px) translateX(-6px) rotate(-5deg) scale(1.08);
-          }
-          75% {
-            transform: translateY(-10px) translateX(10px) rotate(4deg) scale(1.03);
-          }
-          100% {
-            transform: translateY(0px) translateX(0px) rotate(0deg) scale(1);
+            transform: translate(
+              25px,
+              -45px
+            ) rotate(18deg);
           }
         }
 
-        .tv-karaoke-sidebar,
-        .tv-karaoke-main,
-        .tv-toast,
-        .host-warning {
+        .tv-side,
+        .tv-content-new {
           position: relative;
           z-index: 1;
         }
 
-        .tv-karaoke-sidebar {
+        .tv-side {
           display: flex;
           flex-direction: column;
-          gap: 18px;
-          padding: 26px 20px;
-          border-right: 1px solid rgba(255, 255, 255, 0.08);
-          background: rgba(9, 7, 20, 0.74);
+          height: 100vh;
+          min-height: 650px;
+          padding: 26px 18px;
+          background: #0c091bd9;
+          border-right:
+            1px solid #ffffff15;
           backdrop-filter: blur(14px);
         }
 
-        .tv-sidebar-brand {
+        .tv-logo {
           display: flex;
           align-items: center;
           gap: 12px;
+          margin-bottom: 24px;
         }
 
-        .tv-brand-badge {
+        .logo-icon {
           width: 48px;
           height: 48px;
-          border-radius: 16px;
           display: grid;
           place-items: center;
-          background: linear-gradient(135deg, #a855f7, #ec4899);
-          box-shadow: 0 10px 30px rgba(168, 85, 247, 0.32);
+          border-radius: 15px;
+          background: linear-gradient(
+            135deg,
+            #9333ea,
+            #ec4899
+          );
+          box-shadow:
+            0 0 30px #9333ea55;
         }
 
-        .tv-brand-name {
-          font-size: 28px;
-          font-weight: 800;
-          letter-spacing: 0.04em;
+        .tv-logo strong {
+          display: block;
+          font-size: 27px;
+          font-weight: 900;
+          letter-spacing: 1px;
         }
 
-        .tv-brand-name span {
+        .tv-logo strong span {
           color: #f472b6;
         }
 
-        .tv-brand-subtitle {
+        .tv-logo small {
+          display: block;
+          margin-top: 3px;
+          font-size: 9px;
+          letter-spacing: 2px;
+          color: #aaa0c2;
+        }
+
+        .room-code {
+          padding: 14px;
+          border-radius: 14px;
+          background: #ffffff0c;
+          color: #bdb2d3;
+          font-size: 13px;
+          margin-bottom: 25px;
+        }
+
+        .room-code strong {
+          color: white;
+          letter-spacing: 3px;
+          margin-left: 9px;
+        }
+
+        .queue-heading {
+          display: flex;
+          align-items: center;
+          gap: 9px;
+          color: #e9d5ff;
           font-size: 12px;
-          text-transform: uppercase;
-          letter-spacing: 0.18em;
-          color: rgba(255, 255, 255, 0.6);
-        }
-
-        .tv-sidebar-room-code {
-          padding: 14px 16px;
-          border-radius: 18px;
-          background: rgba(255, 255, 255, 0.06);
-          font-size: 14px;
-          color: rgba(255, 255, 255, 0.78);
-        }
-
-        .tv-sidebar-room-code strong {
-          color: #fff;
-          letter-spacing: 0.12em;
-          margin-left: 6px;
-        }
-
-        .tv-sidebar-section-title {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          font-size: 14px;
-          font-weight: 700;
-          text-transform: uppercase;
-          letter-spacing: 0.12em;
-          color: #e9d5ff;
-        }
-
-        .tv-queue-list {
-          flex: 1;
-          overflow: auto;
-          display: flex;
-          flex-direction: column;
-          gap: 12px;
-          padding-right: 4px;
-        }
-
-        .tv-queue-list::-webkit-scrollbar {
-          width: 8px;
-        }
-
-        .tv-queue-list::-webkit-scrollbar-thumb {
-          background: rgba(255, 255, 255, 0.12);
-          border-radius: 999px;
-        }
-
-        .tv-queue-empty {
-          border: 1px dashed rgba(255, 255, 255, 0.15);
-          background: rgba(255, 255, 255, 0.04);
-          border-radius: 20px;
-          padding: 28px 18px;
-          text-align: center;
-          color: rgba(255, 255, 255, 0.72);
-          display: flex;
-          flex-direction: column;
-          gap: 10px;
-          align-items: center;
-          justify-content: center;
-          min-height: 220px;
-        }
-
-        .tv-queue-empty span {
-          font-size: 13px;
-          color: rgba(255, 255, 255, 0.52);
-        }
-
-        .tv-queue-item {
-          display: grid;
-          grid-template-columns: 34px 58px 1fr 34px;
-          align-items: center;
-          gap: 10px;
-          padding: 10px;
-          border-radius: 18px;
-          background: rgba(255, 255, 255, 0.05);
-          border: 1px solid rgba(255, 255, 255, 0.06);
-        }
-
-        .tv-queue-position {
-          font-size: 13px;
           font-weight: 800;
-          color: #e9d5ff;
-          text-align: center;
+          letter-spacing: 1px;
+          margin-bottom: 15px;
         }
 
-        .tv-queue-thumb {
-          width: 58px;
-          height: 44px;
-          object-fit: cover;
-          border-radius: 12px;
+        .queue-heading b {
+          margin-left: auto;
+          background: #a855f722;
+          padding: 5px 9px;
+          border-radius: 9px;
         }
 
-        .tv-queue-info {
-          min-width: 0;
+        .tv-list {
+          flex: 1;
+          min-height: 0;
+          overflow-y: auto;
           display: flex;
           flex-direction: column;
+          gap: 10px;
+          padding-right: 3px;
         }
 
-        .tv-queue-info strong {
-          font-size: 14px;
-          line-height: 1.25;
+        .empty-queue {
+          padding: 32px 18px;
+          border-radius: 18px;
+          background: #ffffff08;
+          border: 1px dashed #ffffff25;
+          text-align: center;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 11px;
+          color: #c4b5fd;
+        }
+
+        .empty-queue p {
+          font-size: 12px;
+          line-height: 1.5;
+          color: #a99bbf;
+        }
+
+        .queue-track {
+          display: flex;
+          align-items: center;
+          gap: 9px;
+          padding: 9px;
+          border-radius: 13px;
+          background: #ffffff0c;
+          border: 1px solid #ffffff0a;
+        }
+
+        .track-position {
+          font-size: 12px;
+          color: #c4b5fd;
+          font-weight: 900;
+        }
+
+        .queue-track img {
+          width: 52px;
+          height: 42px;
+          object-fit: cover;
+          border-radius: 9px;
+          flex-shrink: 0;
+        }
+
+        .queue-info {
+          flex: 1;
+          min-width: 0;
+        }
+
+        .queue-info strong {
+          display: block;
+          font-size: 12px;
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
         }
 
-        .tv-queue-info span {
-          font-size: 12px;
-          color: rgba(255, 255, 255, 0.62);
-          margin-top: 2px;
+        .queue-info small {
+          display: block;
+          margin-top: 5px;
+          color: #b2a5c7;
+          font-size: 11px;
         }
 
-        .tv-queue-remove {
-          width: 32px;
-          height: 32px;
+        .remove-track {
           border: none;
-          border-radius: 10px;
-          display: grid;
-          place-items: center;
-          background: rgba(255, 255, 255, 0.08);
-          color: #fff;
+          color: #cbbddd;
+          background: transparent;
           cursor: pointer;
+          padding: 7px;
         }
 
-        .tv-sidebar-stats {
+        .tv-stats {
           display: grid;
           grid-template-columns: 1fr 1fr;
           gap: 10px;
+          margin-top: 15px;
         }
 
-        .tv-stat-box {
+        .tv-stats div {
           padding: 16px;
-          border-radius: 18px;
-          background: rgba(255, 255, 255, 0.05);
-          border: 1px solid rgba(255, 255, 255, 0.06);
+          border-radius: 15px;
+          background: #ffffff0b;
         }
 
-        .tv-stat-box span {
+        .tv-stats span {
           display: block;
-          font-size: 12px;
-          color: rgba(255, 255, 255, 0.65);
-          margin-bottom: 8px;
+          font-size: 10px;
+          letter-spacing: 1px;
+          color: #aaa0bc;
         }
 
-        .tv-stat-box strong {
+        .tv-stats strong {
+          display: block;
           font-size: 28px;
-          font-weight: 800;
+          margin-top: 7px;
         }
 
-        .tv-karaoke-main {
-          padding: 24px;
+        .tv-content-new {
           display: flex;
           flex-direction: column;
-          gap: 18px;
+          padding: 24px;
+          min-width: 0;
+          height: 100vh;
+          min-height: 650px;
+          gap: 20px;
         }
 
-        .tv-topbar {
+        .tv-top {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 15px;
+        }
+
+        .live-label {
           display: flex;
           align-items: center;
-          justify-content: space-between;
-          gap: 18px;
-        }
-
-        .tv-live-pill {
-          display: inline-flex;
-          align-items: center;
           gap: 8px;
-          padding: 8px 14px;
-          border-radius: 999px;
-          background: rgba(255, 255, 255, 0.08);
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          font-size: 12px;
-          font-weight: 700;
-          letter-spacing: 0.08em;
+          font-size: 11px;
+          color: #d8b4fe;
+          font-weight: 800;
+          letter-spacing: 1.5px;
         }
 
-        .tv-live-dot {
+        .live-dot {
           width: 8px;
           height: 8px;
-          border-radius: 999px;
-          background: #f43f5e;
-          box-shadow: 0 0 12px rgba(244, 63, 94, 0.9);
+          border-radius: 50%;
+          background: #fb7185;
+          box-shadow: 0 0 12px #fb7185;
         }
 
-        .tv-party-title {
-          margin: 12px 0 0;
-          font-size: 34px;
-          line-height: 1.1;
-          font-weight: 800;
+        .tv-top h1 {
+          margin: 8px 0 0;
+          font-size: clamp(
+            22px,
+            2.6vw,
+            36px
+          );
+          font-weight: 900;
         }
 
-        .tv-icon-button {
+        .tv-top h1 span {
+          color: #f472b6;
+        }
+
+        .fullscreen-button {
           width: 46px;
           height: 46px;
-          border: none;
-          border-radius: 14px;
           display: grid;
           place-items: center;
-          background: rgba(255, 255, 255, 0.08);
-          color: #fff;
+          color: white;
+          background: #ffffff12;
+          border: none;
+          border-radius: 14px;
           cursor: pointer;
         }
 
-        .tv-stage-card {
+        .main-stage {
+          display: flex;
           flex: 1;
           min-height: 0;
-          display: flex;
           flex-direction: column;
-          gap: 16px;
+          gap: 15px;
         }
 
-        .tv-stage-player {
+        .stage-screen {
           position: relative;
           flex: 1;
-          min-height: 0;
-          border-radius: 28px;
+          min-height: 300px;
+          border-radius: 22px;
           overflow: hidden;
-          background: rgba(255, 255, 255, 0.04);
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          box-shadow: 0 25px 80px rgba(0, 0, 0, 0.35);
+          background: #090612;
+          border: 1px solid #ffffff1d;
+          box-shadow:
+            0 25px 80px #00000055;
         }
 
-        .tv-stage-empty-overlay {
+        .stage-waiting {
           position: absolute;
           inset: 0;
           display: flex;
           flex-direction: column;
           align-items: center;
           justify-content: center;
+          gap: 14px;
+          padding: 25px;
           text-align: center;
-          padding: 28px;
           background:
-            radial-gradient(circle at center, rgba(168, 85, 247, 0.14), transparent 35%),
-            rgba(8, 6, 18, 0.82);
+            radial-gradient(
+              circle,
+              #52217940,
+              transparent 65%
+            ),
+            #0e0920;
+          z-index: 5;
         }
 
-        .tv-stage-empty-icon {
-          color: #f0abfc;
-          margin-bottom: 16px;
-          opacity: 0.95;
+        .waiting-icon {
+          color: #e879f9;
         }
 
-        .tv-stage-empty-mini {
-          font-size: 12px;
-          font-weight: 700;
-          letter-spacing: 0.18em;
-          color: rgba(255, 255, 255, 0.64);
-        }
-
-        .tv-stage-empty-overlay h2 {
-          margin: 12px 0 10px;
-          font-size: 34px;
+        .stage-waiting > span {
+          font-size: 11px;
           font-weight: 800;
+          letter-spacing: 2px;
+          color: #c4b5fd;
         }
 
-        .tv-stage-empty-overlay p {
-          max-width: 520px;
-          color: rgba(255, 255, 255, 0.72);
-          margin-bottom: 24px;
-          line-height: 1.55;
+        .stage-waiting h2 {
+          font-size: clamp(
+            22px,
+            3vw,
+            38px
+          );
+          font-weight: 900;
         }
 
-        .tv-main-action-button {
-          display: inline-flex;
+        .stage-waiting p {
+          max-width: 400px;
+          color: #b8accb;
+          line-height: 1.5;
+          font-size: 14px;
+        }
+
+        .start-show {
+          display: flex;
           align-items: center;
           gap: 10px;
+          padding: 14px 25px;
+          margin-top: 8px;
           border: none;
-          cursor: pointer;
-          border-radius: 16px;
-          padding: 14px 22px;
-          background: linear-gradient(135deg, #a855f7, #ec4899);
-          color: #fff;
-          font-size: 15px;
+          border-radius: 13px;
+          color: white;
+          background: linear-gradient(
+            135deg,
+            #9333ea,
+            #ec4899
+          );
           font-weight: 800;
-          box-shadow: 0 18px 40px rgba(168, 85, 247, 0.35);
+          cursor: pointer;
         }
 
-        .tv-main-action-button:disabled {
-          opacity: 0.55;
+        .start-show:disabled {
+          opacity: 0.5;
           cursor: not-allowed;
-          box-shadow: none;
         }
 
-        .tv-now-playing-bar {
+        .playing-bar {
           display: flex;
-          align-items: center;
           justify-content: space-between;
-          gap: 18px;
-          padding: 16px 18px;
-          border-radius: 22px;
-          background: rgba(255, 255, 255, 0.06);
-          border: 1px solid rgba(255, 255, 255, 0.06);
-          backdrop-filter: blur(12px);
+          align-items: center;
+          gap: 15px;
+          padding: 15px;
+          background: #ffffff0c;
+          border: 1px solid #ffffff13;
+          border-radius: 19px;
         }
 
-        .tv-now-playing-left {
-          min-width: 0;
+        .song-meta {
           display: flex;
           align-items: center;
-          gap: 14px;
+          gap: 13px;
+          flex: 1;
+          min-width: 0;
         }
 
-        .tv-now-thumb {
-          width: 64px;
-          height: 64px;
-          border-radius: 16px;
-          overflow: hidden;
-          flex-shrink: 0;
+        .current-cover {
           display: grid;
           place-items: center;
-          background: rgba(255, 255, 255, 0.08);
+          width: 59px;
+          height: 59px;
+          background: #ffffff12;
+          border-radius: 13px;
+          overflow: hidden;
+          flex-shrink: 0;
         }
 
-        .tv-now-thumb img {
+        .current-cover img {
           width: 100%;
           height: 100%;
           object-fit: cover;
         }
 
-        .tv-now-meta {
-          min-width: 0;
+        .current-info {
           display: flex;
           flex-direction: column;
+          gap: 5px;
+          min-width: 0;
         }
 
-        .tv-now-meta span {
-          font-size: 11px;
+        .current-info small {
+          font-size: 10px;
+          color: #c4b5fd;
+          letter-spacing: 1.5px;
           font-weight: 700;
-          letter-spacing: 0.16em;
-          color: rgba(255, 255, 255, 0.58);
         }
 
-        .tv-now-meta strong {
-          margin-top: 6px;
-          font-size: 20px;
-          line-height: 1.25;
+        .current-info strong {
+          font-size: 16px;
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
         }
 
-        .tv-now-meta small {
-          margin-top: 5px;
-          color: rgba(255, 255, 255, 0.72);
-          font-size: 13px;
+        .current-info span {
+          font-size: 12px;
+          color: #b5a7c8;
         }
 
-        .tv-player-actions {
+        .play-controls {
           display: flex;
-          align-items: center;
-          gap: 10px;
+          gap: 9px;
           flex-shrink: 0;
         }
 
-        .tv-main-play,
-        .tv-skip-button {
-          width: 52px;
-          height: 52px;
-          border: none;
-          border-radius: 16px;
+        .control-play,
+        .control-next {
+          width: 50px;
+          height: 50px;
           display: grid;
           place-items: center;
+          border: none;
+          border-radius: 14px;
+          color: white;
           cursor: pointer;
-          color: #fff;
         }
 
-        .tv-main-play {
-          background: linear-gradient(135deg, #a855f7, #ec4899);
-          box-shadow: 0 16px 30px rgba(168, 85, 247, 0.28);
+        .control-play {
+          background: linear-gradient(
+            135deg,
+            #9333ea,
+            #ec4899
+          );
         }
 
-        .tv-skip-button {
-          background: rgba(255, 255, 255, 0.08);
+        .control-next {
+          background: #ffffff17;
         }
 
-        .tv-main-play:disabled,
-        .tv-skip-button:disabled {
+        .control-play:disabled,
+        .control-next:disabled {
           opacity: 0.5;
           cursor: not-allowed;
-          box-shadow: none;
         }
 
-        .tv-toast {
+        .tv-message,
+        .tv-warning {
           position: fixed;
-          left: 50%;
-          bottom: 18px;
-          transform: translateX(-50%);
+          z-index: 100;
+          right: 20px;
+          bottom: 20px;
           display: flex;
           align-items: center;
           gap: 10px;
-          padding: 12px 16px;
+          padding: 14px 18px;
           border-radius: 14px;
-          background: rgba(18, 15, 33, 0.92);
-          color: #fff;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          backdrop-filter: blur(14px);
-          z-index: 20;
+          background: #221335;
+          color: white;
+          box-shadow: 0 15px 40px #0008;
+          max-width: 420px;
         }
 
-        .tv-toast button {
+        .tv-message button {
           background: transparent;
+          color: white;
+          font-size: 20px;
           border: none;
-          color: #fff;
-          font-size: 18px;
           cursor: pointer;
         }
 
-        .host-warning {
-          position: fixed;
-          right: 18px;
-          bottom: 18px;
-          max-width: 360px;
-          padding: 14px 16px;
-          border-radius: 16px;
-          background: rgba(127, 29, 29, 0.92);
-          color: #fff;
-          z-index: 20;
-          display: flex;
-          flex-direction: column;
-          gap: 8px;
+        .tv-warning {
+          left: 350px;
+          right: auto;
+          background: #7f1d1d;
         }
 
-        .host-warning a {
-          color: #fff;
-          font-weight: 700;
+        .tv-warning a {
           text-decoration: underline;
+          font-weight: 700;
         }
 
-        @media (max-width: 1200px) {
-          .tv-karaoke-shell {
-            grid-template-columns: 320px 1fr;
+        @media (max-width: 1050px) {
+          .kaioke-tv {
+            grid-template-columns: 275px
+              minmax(0, 1fr);
           }
 
-          .tv-party-title {
-            font-size: 28px;
+          .tv-side {
+            padding: 18px 12px;
+          }
+
+          .tv-content-new {
+            padding: 16px;
           }
         }
 
-        @media (max-width: 980px) {
-          .tv-karaoke-shell {
+        @media (max-width: 750px) {
+          .kaioke-tv {
             grid-template-columns: 1fr;
           }
 
-          .tv-karaoke-sidebar {
+          .tv-content-new {
+            height: auto;
+            min-height: 75vh;
+            order: 1;
+          }
+
+          .tv-side {
+            height: 450px;
+            min-height: 0;
             order: 2;
           }
 
-          .tv-karaoke-main {
-            order: 1;
+          .stage-screen {
+            aspect-ratio: 16 / 9;
+            flex: auto;
+            min-height: 250px;
+          }
+
+          .tv-warning {
+            left: 15px;
+          }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .floating-effects span {
+            animation: none;
           }
         }
       `}</style>
-    </>
+    </div>
   );
 }
